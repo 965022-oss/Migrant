@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2012-2021 Antmicro
+// Copyright (c) 2012-2024 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in the LICENSE file.
@@ -34,7 +34,11 @@ namespace Antmicro.Migrant
         /// <summary>
         /// Type stamping configuration is inconsistent between stream and deserializer settings.
         /// </summary>
-        WrongStreamConfiguration
+        WrongStreamConfiguration,
+        /// <summary>
+        /// The stream metadata is corrupted.
+        /// </summary>
+        MetadataCorrupted
     }
 }
 

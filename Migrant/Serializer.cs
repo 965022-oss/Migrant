@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2012-2023 Antmicro
+// Copyright (c) 2012-2024 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in the LICENSE file.
@@ -14,6 +14,8 @@ using Antmicro.Migrant.VersionTolerance;
 using System.Collections.ObjectModel;
 using Antmicro.Migrant.Generators;
 using System.Collections;
+using System.Text;
+using System.Linq;
 
 namespace Antmicro.Migrant
 {
@@ -82,9 +84,16 @@ namespace Antmicro.Migrant
         /// <param name='stream'>
         /// Stream to which the given object should be serialized. Has to be writeable.
         /// </param>
-        public void Serialize(object obj, Stream stream)
+        /// <param name='metadataBytes'>
+        /// Generic metadata describing the stream.
+        /// </param>
+        public void Serialize(object obj, Stream stream, byte[] metadataBytes = null)
         {
             WriteHeader(stream);
+            if(metadataBytes != null)
+            {
+                WriteMetadata(stream, metadataBytes);   // Migrant does not allow serializing nulls
+            }
             try
             {
                 TouchWriter(stream);
@@ -102,25 +111,38 @@ namespace Antmicro.Migrant
         /// </summary>
         /// <returns>The open stream serializer.</returns>
         /// <param name="stream">Stream.</param>
-        public OpenStreamSerializer ObtainOpenStreamSerializer(Stream stream)
+        /// <param name="metadataBytes">Generic metadata describing the stream.</param>
+        public OpenStreamSerializer ObtainOpenStreamSerializer(Stream stream, byte[] metadataBytes = null)
         {
             WriteHeader(stream);
+            if(metadataBytes != null)
+            {
+                WriteMetadata(stream, metadataBytes);   // Migrant does not allow serializing nulls
+            }
             serializationDone = true;
+
             var result = new OpenStreamSerializer(CreateWriter(stream));
             return result;
         }
 
         /// <summary>
-        /// Returns the open stream serializer, which can be used to do consecutive deserializations when
+        /// Returns the open stream deserializer, which can be used to do consecutive deserializations when
         /// same technique was used to serialize data.
         /// </summary>
         /// <returns>The open stream deserializer.</returns>
         /// <param name="stream">Stream.</param>
-        public OpenStreamDeserializer ObtainOpenStreamDeserializer(Stream stream)
+        /// <param name="metadataBytes">Stream metadata.</param>
+        public OpenStreamDeserializer ObtainOpenStreamDeserializer(Stream stream, out byte[] metadataBytes)
         {
-            bool preserveReferences;
-            bool disableStamping;
-            ThrowOnWrongResult(TryReadHeader(stream, out preserveReferences, out disableStamping));
+            ThrowOnWrongResult(TryReadHeader(stream, out var preserveReferences, out var disableStamping));
+
+            long streamPosition = stream.Position;
+            var metadataResult = TryReadMetadata(stream, out metadataBytes);
+            if(metadataResult != DeserializationResult.OK)
+            {
+                stream.Seek(streamPosition, SeekOrigin.Begin);
+            }
+            
             if(!settings.UseBuffering)
             {
                 stream = new PeekableStream(stream);
@@ -201,8 +223,24 @@ namespace Antmicro.Migrant
         /// </typeparam>
         public T Deserialize<T>(Stream stream)
         {
-            T result;
-            ThrowOnWrongResult(TryDeserialize(stream, out result));
+            ThrowOnWrongResult(TryDeserialize(stream, out T result));
+            return result;
+        }
+
+        /// <summary>
+        /// Deserializes object from the specified stream.
+        /// </summary>
+        /// <param name='stream'>
+        /// The stream to read data from. Must be readable.
+        /// </param>
+        /// <param name="metadataBytes">Stream metadata.</param>
+        /// <typeparam name='T'>
+        /// The expected type of the deserialized object. The deserialized object must be
+        /// convertible to this type.
+        /// </typeparam>
+        public T Deserialize<T>(Stream stream, out byte[] metadataBytes)
+        {
+            ThrowOnWrongResult(TryDeserialize(stream, out T result, out metadataBytes));
             return result;
         }
 
@@ -218,11 +256,30 @@ namespace Antmicro.Migrant
         /// The expected type of the deserialized object. The deserialized object must be
         /// convertible to this type.
         /// </typeparam>
-        public DeserializationResult TryDeserialize<T>(Stream stream, out T obj)
+        public DeserializationResult TryDeserialize<T>(Stream stream, out T obj) 
+        {
+            return TryDeserialize(stream, out obj, out var _);
+        }
+
+        /// <summary>
+        /// Tries to deserialize object from specified stream.
+        /// </summary>
+        /// <returns>Operation result status.</returns>
+        /// <param name="stream">
+        /// The stream to read data from. Must be readable.
+        /// </param>
+        /// <param name="obj">Deserialized object.</param>
+        /// <param name="metadataBytes">Stream metadata.</param>
+        /// <typeparam name="T">
+        /// The expected type of the deserialized object. The deserialized object must be
+        /// convertible to this type.
+        /// </typeparam>
+        public DeserializationResult TryDeserialize<T>(Stream stream, out T obj, out byte[] metadataBytes)
         {
             bool unused;
             bool disableStamping;
             obj = default(T);
+            metadataBytes = null;
 
             var headerResult = TryReadHeader(stream, out unused, out disableStamping);
             if(headerResult != DeserializationResult.OK)
@@ -234,7 +291,21 @@ namespace Antmicro.Migrant
                 return DeserializationResult.WrongStreamConfiguration;
             }
 
+            bool readMetadata = false;
+            long streamPosition = stream.Position;
+
+            var metadataResult = TryReadMetadata(stream, out metadataBytes);
+            if(metadataResult != DeserializationResult.OK)
+            {
+                stream.Seek(streamPosition, SeekOrigin.Begin);
+            }
+            else
+            {
+                readMetadata = true;
+            }
+
             TouchReader(stream);
+
             try
             {
                 obj = reader.ReadObject<T>();
@@ -249,7 +320,7 @@ namespace Antmicro.Migrant
             catch(Exception ex)
             {
                 LastException = ex;
-                return DeserializationResult.StreamCorrupted;
+                return readMetadata ? DeserializationResult.StreamCorrupted : DeserializationResult.MetadataCorrupted;
             }
             finally
             {
@@ -323,6 +394,27 @@ namespace Antmicro.Migrant
             stream.WriteByte(VersionNumber);
             stream.WriteByte(settings.ReferencePreservation == ReferencePreservation.DoNotPreserve ? (byte)0 : (byte)1);
             stream.WriteByte(settings.DisableTypeStamping ? (byte)0 : (byte)1);
+        }
+
+        private byte ChecksumBytes(byte[] bytes)
+        {
+            return (byte)bytes.Aggregate(0x00, (acc, b) => acc ^ b);
+        }
+
+        private void WriteMetadata(Stream stream, byte[] metadataBytes)
+        {
+            if(metadataBytes.Length > MaximumMetadataLength)
+            {
+                throw new ArgumentException($"Metadata should be at most {MaximumMetadataLength} bytes long.");
+            }
+
+            stream.WriteByte((byte)metadataBytes.Length);
+            stream.Write(metadataBytes, 0, metadataBytes.Length);
+
+            // Append single-byte checksum - allows for a simple check if metadata was corrupted and a way to discern old format streams from the new format
+            // (if the checksum doesn't match, either the metadata is corrupted or the stream is in the old format)
+            var checksum = ChecksumBytes(metadataBytes);
+            stream.WriteByte(checksum);
         }
 
         private void TouchWriter(Stream stream)
@@ -438,6 +530,33 @@ namespace Antmicro.Migrant
             }
             preserveReferences = stream.ReadByteOrThrow() != 0;
             disableStamping = stream.ReadByteOrThrow() == 0;
+            return DeserializationResult.OK;
+        }
+
+        private DeserializationResult TryReadMetadata(Stream stream, out byte[] metadataBytes)
+        {
+            metadataBytes = null;
+
+            // Read number of bytes - 0 is invalid
+            var metadataLength = stream.ReadByteOrThrow();
+            if(metadataLength == 0)
+            {
+                return DeserializationResult.MetadataCorrupted;
+            }
+
+            // Read actual metadata
+            var buffer = new byte[metadataLength];
+            stream.Read(buffer, 0, metadataLength);
+
+            // Read checksum and verify if metadata is correct
+            // If it's incorrect, we could be deserializing a stream in the old format or the metadata is simply corrupted
+            var checksum = stream.ReadByteOrThrow();
+            if(ChecksumBytes(buffer) != checksum)
+            {
+                return DeserializationResult.MetadataCorrupted;
+            }
+
+            metadataBytes = buffer;
             return DeserializationResult.OK;
         }
 
@@ -573,6 +692,7 @@ namespace Antmicro.Migrant
         private const byte Magic1 = 0x32;
         private const byte Magic2 = 0x66;
         private const byte Magic3 = 0x34;
+        private const byte MaximumMetadataLength = 255;
 
         #if DEBUG_FORMAT
         public static readonly bool DumpStream = true;
